@@ -1,0 +1,18 @@
+[Unit]
+Description=ERPNext Telegram yordamchi-bot (Claude API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=erpbot
+WorkingDirectory=/home/erpbot
+ExecStart=/home/erpbot/.venv/bin/python /home/erpbot/agent.py
+Restart=always
+RestartSec=5
+# Loglar journalctl -u erpbot da ko'rinadi
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

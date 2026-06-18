@@ -1,0 +1,6 @@
+# Maxfiy sozlamalar — hech qachon commit qilinmasin
+.env
+
+# Python
+__pycache__/
+*.pyc

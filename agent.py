@@ -24,8 +24,16 @@ import ast
 import csv
 import json
 import time
+import threading
+import traceback
 import requests
 from pathlib import Path
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9
+    ZoneInfo = None
 
 # ===================== SOZLAMALAR (.env dan yuklanadi) =====================
 # Barcha maxfiy qiymatlar agent.py yonidagi .env faylida turadi:
@@ -73,6 +81,12 @@ def _load_env(path=None):
 # Standart (bo'sh) qiymatlar — IDE/statik tahlil ko'rishi uchun. Haqiqiy
 # qiymatlarni _load_env() quyida .env dan o'qib, shularning ustiga yozadi.
 ERP_URL = ERP_KEY = ERP_SECRET = ANTHROPIC_KEY = MODEL = TG_TOKEN = COMPANY = ""
+# Ixtiyoriy (yangi) sozlamalar:
+#   MODEL_SMART  — tahlil/CFO savollari uchun kuchliroq model (masalan claude-sonnet-4-6).
+#                  Bo'sh bo'lsa hamma narsa uchun MODEL ishlatiladi.
+#   TIMEZONE     — "bugun/kecha/bu oy" qaysi vaqt mintaqasida hisoblanishi (default Asia/Tashkent).
+#   DOCUMENTS_DIR— tayyor hisobot fayllari (balans/pnl PDF) turadigan papka.
+MODEL_SMART = TIMEZONE = DOCUMENTS_DIR = ""
 ALLOWED_USERS = []
 
 _load_env()
@@ -85,30 +99,55 @@ if _missing:
     raise SystemExit("DIQQAT: .env da quyidagilar yo'q yoki bo'sh: " + ", ".join(_missing))
 if not isinstance(ALLOWED_USERS, (list, tuple, set)):
     raise SystemExit("DIQQAT: .env dagi ALLOWED_USERS ro'yxat bo'lishi kerak, masalan: [123, 456]")
-COMPANY = globals().get("COMPANY") or ""   # bo'sh => avtomatik aniqlanadi
+COMPANY = globals().get("COMPANY") or ""        # bo'sh => avtomatik aniqlanadi
+MODEL_SMART = globals().get("MODEL_SMART") or ""  # bo'sh => MODEL ishlatiladi
+TIMEZONE = globals().get("TIMEZONE") or "Asia/Tashkent"
+DOCUMENTS_DIR = globals().get("DOCUMENTS_DIR") or str(Path(__file__).with_name("documents"))
+CURRENCY = globals().get("CURRENCY") or ""      # kompaniya hisob valyutasi (avtomatik aniqlanadi)
 
 ERP_HEADERS = {"Authorization": f"token {ERP_KEY}:{ERP_SECRET}"}
 
 
+def _now():
+    """Sozlangan vaqt mintaqasidagi hozirgi vaqt. 'bugun/kecha' shunga asoslanadi."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(TIMEZONE))
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def _log(*parts):
+    """Stdout'ga vaqt belgili audit yozuvi (systemd journal yig'ib oladi)."""
+    print(f"[{_now():%Y-%m-%d %H:%M:%S}]", *parts, flush=True)
+
+
 def _autodetect_company():
-    """COMPANY bo'sh bo'lsa, ERPNext'da bitta kompaniya bo'lsa uni avtomatik oladi."""
-    global COMPANY
-    if COMPANY:
-        return
+    """COMPANY bo'sh bo'lsa, ERPNext'da bitta kompaniya bo'lsa uni avtomatik oladi.
+    Shu bilan birga kompaniyaning hisob VALYUTASINI (CURRENCY) ham aniqlaydi."""
+    global COMPANY, CURRENCY
     try:
         r = requests.get(f"{ERP_URL}/api/resource/Company",
                          headers=ERP_HEADERS,
-                         params={"fields": json.dumps(["name"]), "limit_page_length": 5},
+                         params={"fields": json.dumps(["name", "default_currency"]),
+                                 "limit_page_length": 20},
                          timeout=30)
         r.raise_for_status()
         comps = r.json().get("data", [])
-        if len(comps) == 1:
-            COMPANY = comps[0]["name"]
-            print(f"Kompaniya avtomatik aniqlandi: {COMPANY}")
-        elif len(comps) > 1:
-            print(f"DIQQAT: {len(comps)} ta kompaniya bor. SOZLAMALAR'da COMPANY ni to'ldiring.")
+        if not COMPANY:
+            if len(comps) == 1:
+                COMPANY = comps[0]["name"]
+                print(f"Kompaniya avtomatik aniqlandi: {COMPANY}")
+            elif len(comps) > 1:
+                print(f"DIQQAT: {len(comps)} ta kompaniya bor. SOZLAMALAR'da COMPANY ni to'ldiring.")
+        if not CURRENCY:
+            match = next((c for c in comps if c.get("name") == COMPANY), None) or (comps[0] if comps else None)
+            if match and match.get("default_currency"):
+                CURRENCY = match["default_currency"]
+                print(f"Hisob valyutasi aniqlandi: {CURRENCY}")
     except Exception as e:
-        print("Kompaniyani aniqlab bo'lmadi:", e)
+        print("Kompaniya/valyutani aniqlab bo'lmadi:", e)
 
 
 # ============ ERPNext O'QISH funksiyalari (tool'lar shu yerda bajariladi) =====
@@ -167,6 +206,54 @@ def erp_get_doc(doctype, name):
     return r.json().get("data", {})
 
 
+def erp_ledger(party=None, account=None, voucher_no=None, voucher_type=None,
+               from_date=None, to_date=None, party_type=None, limit=50, filters=None):
+    """
+    GL Entry (bosh kitob) — TRANZAKSIYALARNING chuqur tafsiloti: pul qaysi hisobdan
+    qaysi hisobga ketgani, kim bilan (party), debet/kredit, qaysi hujjat orqali.
+      account     — hisob (qism nom ham bo'ladi, 'like' bilan qidiriladi), masalan 'Банк' yoki '1311'
+      party       — mijoz/yetkazib beruvchi/xodim nomi
+      voucher_no  — aniq hujjat raqami (masalan to'lov yoki invoys)
+      voucher_type— Payment Entry / Sales Invoice / Journal Entry / Purchase Invoice ...
+      from_date/to_date — sana oralig'i (posting_date)
+    Natijada har posting: account, against (qarama-qarshi hisob), party, debit, credit,
+    voucher_type, voucher_no, against_voucher (bog'liq invoys), remarks.
+    """
+    f = list(filters or [])
+    f.append(["is_cancelled", "=", 0])
+    if COMPANY:
+        f.append(["company", "=", COMPANY])
+    if party:
+        f.append(["party", "=", party])
+    if party_type:
+        f.append(["party_type", "=", party_type])
+    if account:
+        f.append(["account", "like", f"%{account}%"])
+    if voucher_no:
+        f.append(["voucher_no", "=", voucher_no])
+    if voucher_type:
+        f.append(["voucher_type", "=", voucher_type])
+    if from_date and to_date:
+        f.append(["posting_date", "between", [from_date, to_date]])
+    elif from_date:
+        f.append(["posting_date", ">=", from_date])
+    elif to_date:
+        f.append(["posting_date", "<=", to_date])
+    fields = ["posting_date", "account", "against", "party_type", "party",
+              "debit", "credit", "voucher_type", "voucher_no",
+              "against_voucher_type", "against_voucher", "remarks"]
+    params = {
+        "filters": json.dumps(f),
+        "fields": json.dumps(fields),
+        "limit_page_length": min(int(limit or 50), 200),
+        "order_by": "posting_date desc, creation desc",
+    }
+    r = requests.get(f"{ERP_URL}/api/resource/GL Entry",
+                     headers=ERP_HEADERS, params=params, timeout=90)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
 def erp_aggregate(doctype, group_by, metric="sum", field="base_grand_total",
                   filters=None, order="desc", limit=50):
     """
@@ -175,6 +262,10 @@ def erp_aggregate(doctype, group_by, metric="sum", field="base_grand_total",
              group_by="customer", metric="sum", field="base_grand_total".
     metric: sum | count | avg | max | min
     """
+    if doctype in CHILD_DOCTYPES:
+        # Child table'larni /resource group_by bilan yig'ib bo'lmaydi — tushunarli xato qaytaramiz.
+        return {"error": f"'{doctype}' — bu child (qator) table. Uni erp_aggregate bilan "
+                         f"guruhlab bo'lmaydi. Tovar darajasidagi tahlil uchun erp_profit_breakdown ishlat."}
     expr = "count(name)" if metric == "count" else f"{metric}(`{field}`)"
     params = {
         "fields": json.dumps([group_by, f"{expr} as value"]),
@@ -226,19 +317,22 @@ def erp_run_report(report_name, filters=None):
     cols = []
     for c in msg.get("columns", []):
         cols.append(c.get("label") or c.get("fieldname") if isinstance(c, dict) else str(c).split(":")[0])
-    return {"columns": cols, "rows": msg.get("result", [])[:200]}
+    return {"columns": cols, "rows": msg.get("result", [])[:400]}
 
 
-def erp_profit_breakdown(from_date, to_date, by="item_code", customer=None, top=20, company=None):
+def erp_profit_breakdown(from_date, to_date, by="item_code", customer=None, top=20,
+                         company=None, rank_by="gross_profit", order="desc"):
     """
-    Real FOYDANI mijoz/tovar kesimida hisoblaydi.
-    'Gross Profit' hisobotini Invoice darajasida olib (har qatorda customer+item+gross_profit),
-    so'ng Python ichida qayta yig'adi. Shu sababli 'falon mijozning qaysi tovari ko'p foyda
-    keltiradi' degan ikki bosqichli savolga ham javob bera oladi.
-      by = "item_code"  -> tovarlar bo'yicha
-           "customer"   -> mijozlar bo'yicha
-           "customer_item" -> mijoz+tovar juftligi bo'yicha
-      customer = faqat shu mijoz bilan cheklash (ixtiyoriy)
+    Tovar/mijoz kesimida SOTUV va FOYDANI hisoblaydi (har element uchun: foyda, tushum, miqdor).
+    'Gross Profit' hisobotini Invoice darajasida olib, so'ng Python ichida qayta yig'adi.
+    Shu sababli "top sotilgan mahsulot", "eng kam sotilgan", "qaysi tovar ko'p foyda",
+    "falon mijozning qaysi tovari" kabi savollarning hammasiga javob bera oladi.
+      by      = "item_code" | "customer" | "customer_item"
+      customer= faqat shu mijoz bilan cheklash (ixtiyoriy)
+      rank_by = nima bo'yicha saralash: "gross_profit" (foyda) | "revenue" (tushum/savdo) | "qty" (miqdor)
+                * "Top 10 mahsulot / ko'p sotilgan"  => rank_by="revenue" (yoki "qty")
+                * "Eng ko'p foyda keltiradi"          => rank_by="gross_profit"
+      order   = "desc" (ko'pdan kamga, top) | "asc" (kamdan ko'pga — "eng kam sotilgan" uchun)
     """
     comp = company or COMPANY
     if not comp:
@@ -255,9 +349,10 @@ def erp_profit_breakdown(from_date, to_date, by="item_code", customer=None, top=
         if r.get("customer"):
             cur_customer = r.get("customer")
         item = r.get("item_code")
-        gp = r.get("gross_profit")
-        if not item or gp in (None, ""):
+        if not item:
             continue                      # subtotal/sarlavha qatorini o'tkazib yuboramiz
+        # gross_profit bo'sh bo'lsa ham (tannarx kiritilmagan) tushum/miqdor bo'yicha tahlilga olamiz
+        gp = r.get("gross_profit")
         cust = r.get("customer") or cur_customer
         if customer and cust != customer:
             continue
@@ -269,14 +364,21 @@ def erp_profit_breakdown(from_date, to_date, by="item_code", customer=None, top=
             key = item
         a = agg.setdefault(key, {"gross_profit": 0.0, "revenue": 0.0, "qty": 0.0})
         a["gross_profit"] += float(gp or 0)
-        a["revenue"] += float(r.get("base_amount") or 0)
+        # Gross Profit hisobotida tushum ustuni 'selling_amount' (base_amount emas!)
+        a["revenue"] += float(r.get("selling_amount") or r.get("base_amount") or 0)
         a["qty"] += float(r.get("qty") or 0)
 
-    ranked = sorted(agg.items(), key=lambda kv: kv[1]["gross_profit"], reverse=True)[:top]
+    rank_key = rank_by if rank_by in ("gross_profit", "revenue", "qty") else "gross_profit"
+    ranked = sorted(agg.items(), key=lambda kv: kv[1][rank_key],
+                    reverse=(order != "asc"))[:top]
     if not ranked:
-        return {"warning": "Foyda ma'lumoti topilmadi. Ehtimol tovar tannarxi (valuation) "
-                           "kiritilmagan yoki bu davrda sotuv yo'q.", "items": []}
-    return {"by": by, "customer": customer,
+        return {"warning": "Ma'lumot topilmadi — bu davrda sotuv yo'q yoki hisobot bo'sh. "
+                           "(Foyda bo'sh chiqsa, tovar tannarxi/valuation kiritilmagan bo'lishi mumkin.)",
+                "items": []}
+    return {"by": by, "customer": customer, "ranked_by": rank_key, "order": order,
+            "note": "revenue=tushum/savdo, gross_profit=yalpi foyda, qty=miqdor. "
+                    "Eslatma: bu yerda faqat shu davrda SOTILGAN tovarlar bor "
+                    "(umuman sotilmagan/dead-stock tovarlar uchun Stock hisobotidan foydalaning).",
             "items": [dict(key=k, **v) for k, v in ranked]}
 
 
@@ -504,9 +606,310 @@ def send_report_file(args, chat_id):
             f"Shu hisobot ma'lumoti (kerak bo'lsa tahlil uchun):\n{data_text}")
 
 
+# ============ MOLIYAVIY HISOBOT (Balans / P&L) — GL Entry datasidan =============
+# Kompaniyaning OYLIK Balans va Foyda-Zarar hisobotini REAL ERPNext ma'lumotidan
+# (GL Entry) quradi va kompaniyaning rus tilidagi hisob nomlari bilan, oylik
+# ustunlarda, shablonga o'xshash ko'rinishda PDF/Excel qilib beradi.
+# DIQQAT: standart "Balance Sheet"/"Profit and Loss" hisoboti moliyaviy yil
+# sozlamasiga bog'liq (bu kompaniyada yillar ustma-ust => xato). Shuning uchun
+# biz GL Entry'dan to'g'ridan-to'g'ri hisoblaymiz — moliyaviy yildan mustaqil.
+
+_RU_MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+_ACCOUNTS_CACHE = {}   # company -> (accs, idx, children)
+
+
+def _account_index(company):
+    """Kompaniyaning butun hisob rejasini bir marta olib, keshlaydi."""
+    if company in _ACCOUNTS_CACHE:
+        return _ACCOUNTS_CACHE[company]
+    accs = erp_list("Account",
+                    filters=[["company", "=", company]],
+                    fields=["name", "account_name", "root_type", "parent_account",
+                            "is_group", "account_number", "lft"],
+                    limit=2000, order_by="lft asc")
+    idx = {a["name"]: a for a in accs}
+    children = {}
+    for a in accs:
+        children.setdefault(a.get("parent_account"), []).append(a["name"])
+    _ACCOUNTS_CACHE[company] = (accs, idx, children)
+    return accs, idx, children
+
+
+def _gl_balances(company, d1, d2):
+    """[d1..d2] oralig'ida har hisob bo'yicha (debet − kredit) yig'indisi. Faqat o'qish."""
+    params = {
+        "fields": json.dumps(["account", "sum(debit) as dr", "sum(credit) as cr"]),
+        "filters": json.dumps([["company", "=", company],
+                               ["posting_date", "between", [d1, d2]],
+                               ["is_cancelled", "=", 0]]),
+        "group_by": "account",
+        "limit_page_length": 0,
+    }
+    r = requests.get(f"{ERP_URL}/api/resource/GL Entry",
+                     headers=ERP_HEADERS, params=params, timeout=120)
+    r.raise_for_status()
+    return {x["account"]: (float(x.get("dr") or 0) - float(x.get("cr") or 0))
+            for x in r.json().get("data", [])}
+
+
+def _iter_months(start, end):
+    """'YYYY-MM-DD' oralig'ini oylik bo'laklarga ajratadi (ko'pi bilan 24 oy)."""
+    import calendar
+    y, m = int(start[:4]), int(start[5:7])
+    ey, em = int(end[:4]), int(end[5:7])
+    out = []
+    while (y < ey) or (y == ey and m <= em):
+        last = calendar.monthrange(y, m)[1]
+        out.append({"label": f"{_RU_MONTHS[m - 1]} {y}",
+                    "start": f"{y:04d}-{m:02d}-01", "end": f"{y:04d}-{m:02d}-{last:02d}"})
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+        if len(out) > 24:
+            break
+    return out
+
+
+def _sign(root_type):
+    # Income/Liability/Equity kredit-normal (musbat ko'rsatish uchun belgini teskari)
+    return -1.0 if root_type in ("Income", "Liability", "Equity") else 1.0
+
+
+def build_financial_statement(kind, start, end, company=None):
+    """kind='pnl' yoki 'balance'. Oylik ustunli, ierarxik hisobot tuzilmasini qaytaradi."""
+    company = company or COMPANY
+    if not company:
+        return {"error": "COMPANY aniqlanmagan."}
+    accs, idx, children = _account_index(company)
+    if not accs:
+        return {"error": f"'{company}' uchun hisob rejasi topilmadi."}
+    months = _iter_months(start, end)
+    roots = ("Income", "Expense") if kind == "pnl" else ("Asset", "Liability", "Equity")
+
+    # Har oy uchun hisob qoldiqlari: P&L oy ichidagi aylanma, Balans — boshidan to oy oxirigacha (jami)
+    monthly = []
+    for mo in months:
+        if kind == "pnl":
+            monthly.append(_gl_balances(company, mo["start"], mo["end"]))
+        else:
+            monthly.append(_gl_balances(company, "1900-01-01", mo["end"]))
+
+    def acc_value(name, i):
+        a = idx[name]
+        if a.get("is_group"):
+            return sum(acc_value(c, i) for c in children.get(name, []))
+        return monthly[i].get(name, 0.0) * _sign(a.get("root_type"))
+
+    def depth(name):
+        d, p = 0, idx[name].get("parent_account")
+        while p and p in idx and d < 12:
+            d += 1
+            p = idx[p].get("parent_account")
+        return d
+
+    n = len(months)
+
+    def nonzero(name):
+        return any(abs(acc_value(name, i)) > 0.005 for i in range(n))
+
+    rows = []
+
+    def emit_tree(name):
+        a = idx[name]
+        if not nonzero(name):
+            return
+        vals = [acc_value(name, i) for i in range(n)]
+        label = a.get("account_name") or a["name"]
+        rows.append({"label": label, "indent": depth(name),
+                     "kind": "group" if a.get("is_group") else "leaf", "values": vals})
+        if a.get("is_group"):
+            for c in children.get(name, []):
+                emit_tree(c)
+
+    def root_total(rt):
+        return [sum(acc_value(nm, i) for nm in idx if idx[nm].get("root_type") == rt
+                    and not idx[nm].get("parent_account"))
+                for i in range(n)]
+    # eng yuqori (parent yo'q) hisoblardan boshlab daraxtni chizamiz
+    top_level = [a["name"] for a in accs if not a.get("parent_account")]
+
+    if kind == "pnl":
+        for nm in top_level:
+            if idx[nm].get("root_type") in roots:
+                emit_tree(nm)
+        income_total = root_total("Income")
+        expense_total = root_total("Expense")
+        net = [income_total[i] - expense_total[i] for i in range(n)]
+        rows.append({"label": "Итого доходы (Выручка)", "indent": 0, "kind": "total", "values": income_total})
+        rows.append({"label": "Итого расходы", "indent": 0, "kind": "total", "values": expense_total})
+        rows.append({"label": "Чистая прибыль", "indent": 0, "kind": "grand", "values": net})
+        margin = [(net[i] / income_total[i] * 100 if income_total[i] else 0.0) for i in range(n)]
+        rows.append({"label": "Рентабельность по чистой прибыли, %", "indent": 0,
+                     "kind": "pct", "values": margin})
+        title = "Отчет о прибылях и убытках (P&L)"
+    else:
+        for nm in top_level:
+            if idx[nm].get("root_type") in roots:
+                emit_tree(nm)
+        asset_total = root_total("Asset")
+        liab_total = root_total("Liability")
+        equity_total = root_total("Equity")
+        # Joriy davr (yopilmagan) foydasi kapitalga kiradi — aks holda balans balanslanmaydi.
+        # Balans rejimida qoldiqlar JAMI (inception..oy oxiri), shuning uchun foyda ham jami.
+        retained = [root_total("Income")[i] - root_total("Expense")[i] for i in range(n)]
+        equity_with_pl = [equity_total[i] + retained[i] for i in range(n)]
+        passiv = [liab_total[i] + equity_with_pl[i] for i in range(n)]
+        rows.append({"label": "Прибыль/убыток текущего периода (нераспределённая)",
+                     "indent": 1, "kind": "leaf", "values": retained})
+        rows.append({"label": "Капитал (с учётом прибыли)", "indent": 0, "kind": "total",
+                     "values": equity_with_pl})
+        rows.append({"label": "ИТОГО Активы", "indent": 0, "kind": "grand", "values": asset_total})
+        rows.append({"label": "ИТОГО Пассивы (Обязательства + Капитал)", "indent": 0,
+                     "kind": "grand", "values": passiv})
+        diff = [asset_total[i] - passiv[i] for i in range(n)]
+        rows.append({"label": "Разница (Актив − Пассив)", "indent": 0, "kind": "total", "values": diff})
+        title = "Бухгалтерский баланс"
+
+    return {"kind": kind, "title": title, "company": company,
+            "columns": [mo["label"] for mo in months], "rows": rows}
+
+
+def _fmt_num(v):
+    """1 234 567,89 ko'rinishida (rus formati) — manfiy bo'lsa minus bilan."""
+    try:
+        s = f"{float(v):,.2f}"            # 1,234,567.89
+    except (TypeError, ValueError):
+        return "" if v is None else str(v)
+    s = s.replace(",", " ").replace(".", ",")  # -> 1 234 567,89
+    return s
+
+
+def _statement_matrix(stmt):
+    """xlsx/csv uchun (sarlavhalar, matritsa)."""
+    headers = ["Статья"] + stmt["columns"]
+    matrix = []
+    for r in stmt["rows"]:
+        label = ("    " * r["indent"]) + r["label"]
+        if r["kind"] == "pct":
+            vals = [f"{v:.0f}%" for v in r["values"]]
+        else:
+            vals = r["values"]
+        matrix.append([label] + list(vals))
+    return headers, matrix
+
+
+def _statement_html(stmt):
+    """Shablonga o'xshash, rangli bo'limli HTML (PDF uchun)."""
+    def esc(x):
+        return (str(x) if x is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    th = "".join(f"<th>{esc(c)}</th>" for c in stmt["columns"])
+    trs = []
+    for r in stmt["rows"]:
+        cls = r["kind"]
+        pad = 6 + r["indent"] * 16
+        if r["kind"] == "pct":
+            cells = "".join(f"<td>{v:.0f}%</td>" for v in r["values"])
+        else:
+            cells = "".join(f"<td>{esc(_fmt_num(v))}</td>" for v in r["values"])
+        trs.append(f'<tr class="{cls}"><td class="lbl" style="padding-left:{pad}px">'
+                   f'{esc(r["label"])}</td>{cells}</tr>')
+    return f"""<!doctype html><html><head><meta charset="utf-8"><style>
+        body{{font-family:Arial,sans-serif;font-size:11px;color:#222}}
+        h2{{margin:0 0 2px}} .sub{{color:#666;font-size:10px;margin-bottom:10px}}
+        table{{border-collapse:collapse;width:100%}}
+        th,td{{border:1px solid #ccc;padding:4px 6px;text-align:right;white-space:nowrap}}
+        th{{background:#404040;color:#fff;text-align:right}} th:first-child{{text-align:left}}
+        td.lbl{{text-align:left}}
+        tr.group>td{{background:#f2f2f2;font-weight:bold}}
+        tr.total>td{{font-weight:bold;border-top:2px solid #888}}
+        tr.grand>td{{background:#fde9d9;font-weight:bold;border-top:2px solid #c0504d}}
+        tr.pct>td{{font-style:italic;color:#555}}
+        </style></head><body>
+        <h2>{esc(stmt['title'])}</h2>
+        <div class="sub">{esc(stmt['company'])} · {esc(stmt['columns'][0])} – {esc(stmt['columns'][-1])} · валюта: {esc(CURRENCY or 'USD')}</div>
+        <table><thead><tr><th>Статья</th>{th}</tr></thead><tbody>{''.join(trs)}</tbody></table>
+        </body></html>"""
+
+
+def _statement_pdf(stmt):
+    """HTML'ni ERPNext PDF generatori (wkhtmltopdf) orqali PDF qiladi."""
+    html = _statement_html(stmt)
+    r = requests.post(f"{ERP_URL}/api/method/frappe.utils.print_format.report_to_pdf",
+                      headers=ERP_HEADERS, data={"html": html, "orientation": "Landscape"},
+                      timeout=120)
+    r.raise_for_status()
+    if "pdf" not in r.headers.get("content-type", "") and r.content[:4] != b"%PDF":
+        raise RuntimeError(f"PDF o'rniga boshqa javob: {r.text[:200]}")
+    return r.content
+
+
+def _statement_text(stmt, limit=40000):
+    """Tahlil uchun ixcham JSON-matn (Claude o'qiydi)."""
+    payload = {"title": stmt["title"], "currency": CURRENCY or "USD",
+               "columns": stmt["columns"],
+               "rows": [{"label": r["label"], "indent": r["indent"],
+                         "values": [round(v, 2) if isinstance(v, (int, float)) else v
+                                    for v in r["values"]]} for r in stmt["rows"]]}
+    return json.dumps(payload, ensure_ascii=False, default=str)[:limit]
+
+
+# "balans"/"pnl" so'zlarini kind'ga keltirish
+_FIN_KIND = {
+    "balance": "balance", "balans": "balance", "баланс": "balance", "balance sheet": "balance",
+    "pnl": "pnl", "p&l": "pnl", "pl": "pnl", "foyda zarar": "pnl", "foyda-zarar": "pnl",
+    "foyda va zarar": "pnl", "profit and loss": "pnl", "прибыль": "pnl",
+}
+
+
+def send_financial_statement(args, chat_id):
+    """Balans yoki P&L hisobotini REAL ERPNext (GL) datasidan tuzib, oylik ustunli
+    PDF/Excel qilib Telegram'ga yuboradi va tahlil uchun raqamlarni qaytaradi."""
+    if chat_id is None:
+        return "Fayl yuborib bo'lmadi: chat aniqlanmadi."
+    kind = _FIN_KIND.get((args.get("document") or args.get("kind") or "").strip().lower())
+    if kind is None:
+        return "document 'balance' yoki 'pnl' bo'lishi kerak."
+    start = args.get("period_start_date")
+    end = args.get("period_end_date")
+    if not (start and end):
+        return ("Bu hisobot uchun sana oralig'i kerak. Foydalanuvchidan davrni aniqlab, "
+                "period_start_date va period_end_date (YYYY-MM-DD) ber. Masalan oxirgi 4 oy.")
+    try:
+        stmt = build_financial_statement(kind, start, end)
+    except Exception as e:
+        return f"Hisobotni tuzishda xato: {e}"
+    if stmt.get("error"):
+        return stmt["error"]
+    if not stmt.get("rows"):
+        return "Bu davrda ma'lumot topilmadi (GL bo'sh). Sanani tekshiring."
+
+    fmt = (args.get("file_format") or "pdf").lower()
+    base = f"{kind}_{start}_{end}".replace("-", "")
+    caption = args.get("caption") or f"{stmt['title']} · {stmt['columns'][0]}–{stmt['columns'][-1]}"
+    headers, matrix = _statement_matrix(stmt)
+    try:
+        if fmt == "csv":
+            content, fname = _build_csv(headers, matrix), f"{base}.csv"
+        elif fmt in ("xlsx", "excel"):
+            content, fname = _build_xlsx(headers, matrix, stmt["title"][:31]), f"{base}.xlsx"
+        else:
+            content, fname = _statement_pdf(stmt), f"{base}.pdf"
+    except Exception as e:
+        content, fname = _build_csv(headers, matrix), f"{base}.csv"
+        tg_send_document(chat_id, fname, content, caption=caption)
+        return (f"'{fmt}' yasab bo'lmadi ({e}). CSV yubordim: {fname}.\n"
+                f"Ma'lumot:\n{_statement_text(stmt)}")
+    tg_send_document(chat_id, fname, content, caption=caption)
+    return (f"Fayl yuborildi: {fname} ({len(stmt['columns'])} oy, {len(stmt['rows'])} qator). "
+            f"Real ERPNext (GL) ma'lumoti.\nTahlil uchun raqamlar:\n{_statement_text(stmt)}")
+
+
 def run_tool(name, args, chat_id=None):
     """Claude chaqirgan tool'ni bajarib, natijani matn ko'rinishida qaytaradi."""
     try:
+        if name == "send_financial_statement":
+            return send_financial_statement(args, chat_id)
         if name == "send_report_file":
             return send_report_file(args, chat_id)
         if name == "get_report_data":
@@ -522,6 +925,13 @@ def run_tool(name, args, chat_id=None):
             return json.dumps(data, ensure_ascii=False, default=str)
         elif name == "erp_get_doc":
             data = erp_get_doc(args["doctype"], args["name"])
+            return json.dumps(data, ensure_ascii=False, default=str)
+        elif name == "erp_ledger":
+            data = erp_ledger(
+                args.get("party"), args.get("account"), args.get("voucher_no"),
+                args.get("voucher_type"), args.get("from_date"), args.get("to_date"),
+                args.get("party_type"), args.get("limit", 50), args.get("filters"),
+            )
             return json.dumps(data, ensure_ascii=False, default=str)
         elif name == "erp_aggregate":
             data = erp_aggregate(
@@ -543,6 +953,8 @@ def run_tool(name, args, chat_id=None):
                 args.get("customer"),
                 args.get("top", 20),
                 args.get("company"),
+                args.get("rank_by", "gross_profit"),
+                args.get("order", "desc"),
             )
             return json.dumps(data, ensure_ascii=False, default=str)
         else:
@@ -553,6 +965,32 @@ def run_tool(name, args, chat_id=None):
 
 # ============ Claude uchun tool ta'riflari =====================================
 TOOLS = [
+    {
+        "name": "send_financial_statement",
+        "description": (
+            "Kompaniyaning BALANS yoki FOYDA-ZARAR (P&L) hisobotini REAL ERPNext ma'lumotidan "
+            "(GL Entry) tuzib, OYLIK ustunlarda, kompaniyaning rus tilidagi hisob nomlari bilan "
+            "PDF/Excel qilib yuboradi. Foydalanuvchi 'balans', 'balance', 'foyda-zarar', 'pnl', "
+            "'P&L' so'rasa — SHU tool'ni ishlat (data ERPNext'dan real olinadi). "
+            "document: 'balance' yoki 'pnl'. period_start_date/period_end_date (YYYY-MM-DD) — "
+            "oraliq oylarga bo'linadi (har oy alohida ustun). Sana berilmasa, foydalanuvchidan "
+            "qaysi davr ekanini SO'RA (masalan oxirgi 4 oy). file_format: 'pdf' (default), 'xlsx', 'csv'. "
+            "Eslatma: bu kompaniyada moliyaviy yil sozlamasi muammoli, shuning uchun standart "
+            "Balance Sheet/P&L o'rniga AYNAN shu tool ishlatiladi."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document": {"type": "string", "enum": ["balance", "pnl"],
+                             "description": "balance = balans (Баланс), pnl = foyda-zarar (P&L)"},
+                "period_start_date": {"type": "string", "description": "Davr boshi YYYY-MM-DD"},
+                "period_end_date": {"type": "string", "description": "Davr oxiri YYYY-MM-DD"},
+                "file_format": {"type": "string", "enum": ["pdf", "xlsx", "csv"]},
+                "caption": {"type": "string", "description": "Telegram izohi (ixtiyoriy)"},
+            },
+            "required": ["document", "period_start_date", "period_end_date"],
+        },
+    },
     {
         "name": "erp_list",
         "description": (
@@ -587,6 +1025,32 @@ TOOLS = [
                 "name": {"type": "string", "description": "Hujjat ID/nomi"},
             },
             "required": ["doctype", "name"],
+        },
+    },
+    {
+        "name": "erp_ledger",
+        "description": (
+            "GL Entry (bosh kitob) — TRANZAKSIYALARNI CHUQUR ko'rsatadi: pul qaysi hisobdan "
+            "qaysi hisobga ketdi, KIM bilan (party=mijoz/yetkazib beruvchi/xodim), debet/kredit, "
+            "qaysi hujjat orqali. Foydalanuvchi 'bu to'lov nima', 'pul qayerdan qayerga ketdi', "
+            "'falon mijoz/supplier bilan harakatlar', 'qaysi schotlar ishladi', 'kimga berdik/kimdan "
+            "oldik', 'bu hujjatning provodkasi' desa SHU tool'ni ishlat. "
+            "Har posting: account (hisob), against (qarama-qarshi hisob), party (taraf), debit, credit, "
+            "voucher_type/voucher_no (manba hujjat), against_voucher (bog'liq invoys), remarks. "
+            "voucher_no berilsa — aynan o'sha hujjatning ikki tomonlama provodkasi chiqadi."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "party": {"type": "string", "description": "Mijoz/yetkazib beruvchi/xodim nomi"},
+                "party_type": {"type": "string", "description": "Customer / Supplier / Employee"},
+                "account": {"type": "string", "description": "Hisob nomi yoki qismi (masalan 'Банк', '1311')"},
+                "voucher_no": {"type": "string", "description": "Aniq hujjat raqami (to'lov/invoys)"},
+                "voucher_type": {"type": "string", "description": "Payment Entry / Sales Invoice / Journal Entry ..."},
+                "from_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "to_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "limit": {"type": "integer", "description": "Maks qatorlar (default 50, maks 200)"},
+            },
         },
     },
     {
@@ -633,11 +1097,14 @@ TOOLS = [
     {
         "name": "erp_profit_breakdown",
         "description": (
-            "Real FOYDANI mijoz va/yoki tovar kesimida hisoblaydi. Standart Gross Profit "
-            "hisoboti bera olmaydigan IKKI BOSQICHLI savol uchun: 'falon mijozning qaysi "
-            "tovaridan ko'proq foyda olyapmiz'. Buning uchun customer='Mijoz nomi' va "
-            "by='item_code' ber. Boshqa rejimlar: by='customer' (mijozlar reytingi), "
-            "by='customer_item' (mijoz+tovar juftliklari). Sana oralig'i shart."
+            "Tovar/mijoz kesimida SOTUV va FOYDANI hisoblaydi. TOVAR darajasidagi deyarli "
+            "barcha savollar uchun shu tool: 'Top 10 mahsulot', 'eng ko'p/kam sotilgan', "
+            "'qaysi tovardan ko'p foyda', 'falon mijozning qaysi tovari'. "
+            "rank_by bilan saralash o'zgaradi: 'revenue' (savdo/tushum bo'yicha — 'ko'p sotilgan'), "
+            "'qty' (miqdor bo'yicha), 'gross_profit' (foyda bo'yicha). "
+            "order='asc' => 'eng kam sotilgan'. by='customer' => mijozlar reytingi; "
+            "customer='Nomi' => faqat shu mijoz. Sana oralig'i shart. "
+            "DIQQAT: '...Item' child table'ni erp_aggregate bilan guruhlama — shu tool'dan foydalan."
         ),
         "input_schema": {
             "type": "object",
@@ -646,6 +1113,10 @@ TOOLS = [
                 "to_date": {"type": "string", "description": "YYYY-MM-DD"},
                 "by": {"type": "string", "enum": ["item_code", "customer", "customer_item"]},
                 "customer": {"type": "string", "description": "Faqat shu mijoz bilan cheklash (ixtiyoriy)"},
+                "rank_by": {"type": "string", "enum": ["gross_profit", "revenue", "qty"],
+                            "description": "Saralash mezoni: revenue=savdo, qty=miqdor, gross_profit=foyda"},
+                "order": {"type": "string", "enum": ["desc", "asc"],
+                          "description": "desc=ko'pdan kamga (top), asc=kamdan ko'pga (eng kam)"},
                 "top": {"type": "integer", "description": "Nechta natija (default 20)"},
                 "company": {"type": "string", "description": "Kompaniya nomi (sozlamada bo'lsa shart emas)"},
             },
@@ -698,12 +1169,59 @@ TOOLS = [
             },
             "required": ["report_name"],
         },
+        # Prompt caching: oxirgi tool'gacha bo'lgan BARCHA tool ta'riflari keshlanadi
+        # (har so'rovda qaytadan yuborilmaydi => token va pul tejaladi).
+        "cache_control": {"type": "ephemeral"},
     },
 ]
 
-SYSTEM_PROMPT = f"""Sen — ERPNext bo'yicha o'zbek tilida javob beradigan yordamchi assistantsan.
-Foydalanuvchi savol bersa, kerakli ma'lumotni erp_list yoki erp_get_doc tool'lari
-orqali ERPNext'dan olib, qisqa va aniq javob ber. Raqamlarni o'qiladigan qilib yoz.
+_WEEKDAYS_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
+
+
+def _system_blocks():
+    """Claude uchun system promptni ikki blokda qaytaradi:
+      1) STATIK ko'rsatmalar — prompt caching bilan keshlanadi (token tejaladi);
+      2) bugungi SANA bloki — har kuni o'zgaradi, keshlanmaydi.
+    COMPANY va sana har so'rovda joriy qiymatdan olinadi (autodetect'dan keyin ham to'g'ri)."""
+    company_filter = (f'["company","=","{COMPANY}"]' if COMPANY
+                      else 'kerak emas (hamma kompaniya)')
+    cur = CURRENCY or "USD"
+    # .format() ISHLATMAYMIZ — matnda JSON misollaridagi { } qavslar bor.
+    static = (_SYSTEM_BODY
+              .replace("__COMPANY_FILTER__", company_filter)
+              .replace("__CURRENCY__", cur))
+    n = _now()
+    date_block = (
+        f"MUHIM — BUGUNGI SANA: {n:%Y-%m-%d} ({_WEEKDAYS_UZ[n.weekday()]}), "
+        f"vaqt mintaqasi {TIMEZONE}.\n"
+        "'bugun', 'kecha', 'shu hafta', 'bu oy', 'o'tgan oy', 'shu yil' kabi nisbiy "
+        "iboralarni AYNAN shu sanaga nisbatan hisobla. Hech qachon sanani taxmin qilma — "
+        "agar davr noaniq bo'lsa, foydalanuvchidan aniqlashtirib so'ra."
+    )
+    return [
+        {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": date_block},
+    ]
+
+
+_SYSTEM_BODY = """Sen — Ruxsora Shirinliklari kompaniyasining ERPNext yordamchisisan, o'zbek tilida
+javob berasan. Foydalanuvchi — BIZNES EGASI / rahbar, moliyachi yoki buxgalter EMAS. Shuning
+uchun SODDA, aniq va tushunarli gapir: buxgalteriya atamalari (debet/kredit, provodka, schot
+raqami) o'rniga oddiy tilda "pul kirdi / pul chiqdi / kimga / nima uchun" deb tushuntir.
+Kerakli ma'lumotni tool'lar orqali ERPNext'dan olib, qisqa va aniq javob ber.
+
+═══ PUL BIRLIGI — JUDA MUHIM (eng ko'p chalkashlik shu yerda) ═══
+- Kompaniyaning hisob valyutasi: __CURRENCY__. ERPNext'dan kelgan BARCHA summalar (balans,
+  P&L, GL, invoys, to'lov, qoldiq, foyda) AYNAN shu valyutada — __CURRENCY__.
+- Summani DOIM to'g'ri belgila. __CURRENCY__ = USD bo'lsa "$" yoki "USD" yoz.
+  HECH QACHON summalarni "so'm" deb yozma — raqamlar dollarda, "so'm" desang foydalanuvchi
+  butunlay yanglishadi (masalan 5 357 USD ni "5 357 so'm" desang — 800 barobar xato).
+- "ming", "mln", "milliard" so'zlarini O'ZINGDAN QO'SHMA. Raqamni borligicha yoz, faqat
+  minglikni bo'sh joy bilan ajrat: "354 862 USD" (NE "354 862 ming so'm").
+- Bir to'lov boshqa valyutada kiritilgan bo'lishi mumkin (izoh/remarks'da "UZS 100000000").
+  Bu — original summa. Lekin buxgalteriya (debit/credit) summasi __CURRENCY__ da. Foydalanuvchiga
+  ASOSIY summani (__CURRENCY__) ber, originalni faqat qavsda eslat:
+  "8 183 USD (mijoz 100 000 000 so'm to'lagan)". BIR summani ikki marta ikki xil ko'rsatma!
 
 Foydali bilimlar:
 - Faqat tasdiqlangan hujjatlar uchun filtrga ["docstatus","=",1] qo'sh.
@@ -711,26 +1229,118 @@ Foydali bilimlar:
 - "Invoys qilinmagan Purchase Receipt" = Purchase Receipt, status="To Bill".
 - "Kim kiritgan/yaratgan" = 'owner' maydoni (email). 'creation' = yaratilgan vaqt.
 - Naqd kassa = Payment Entry, mode_of_payment="Cash" (kompaniyada nomi boshqa bo'lishi mumkin).
-- Kompaniya filtri: { '["company","=","'+COMPANY+'"]' if COMPANY else 'kerak emas (hamma kompaniya)' }.
+- Kompaniya filtri: __COMPANY_FILTER__.
 - Sanani 'YYYY-MM-DD' formatida ishlat. Oraliq uchun 'between' operatori: ["posting_date","between",["2026-05-01","2026-05-31"]].
 
-TAHLIL SAVOLLARI uchun:
-- "Kim ko'proq oldi / eng yaxshi mijozlar" => erp_aggregate, doctype="Sales Invoice",
-  group_by="customer", metric="sum", field="base_grand_total", sana filtri bilan.
-- "Falon mijoz bu oy kam oldimi?" => o'sha mijoz uchun har oy (oxirgi 3 oy) alohida
-  erp_aggregate chaqir (filters: customer + posting_date between), keyin oylarni solishtir.
-- "Qaysi tovar ko'p sotilyapti / qaysi tovardan ko'p foyda" => erp_profit_breakdown,
-  by="item_code" ishlat (sana oralig'i bilan). DIQQAT: "Sales Invoice Item" yoki boshqa
-  "... Item" child table'ni erp_aggregate bilan GURUHLAMA — u ishlamaydi. Tovar darajasidagi
-  tahlil uchun DOIM erp_profit_breakdown ishlat.
-- REAL FOYDA so'ralsa => erp_run_report("Gross Profit") yoki erp_profit_breakdown.
-  Agar tannarx kiritilmagan bo'lsa yoki hisobot bo'sh kelsa — buni foydalanuvchiga tushuntir
-  va tushum (revenue) bo'yicha tahlil taklif qil. Tushum ≠ foyda ekanini aniq ayt.
-- "Falon MIJOZNING qaysi TOVARI ko'proq foyda keltiradi" (ikki bosqichli) => 
-  erp_profit_breakdown, customer='Mijoz', by='item_code', sana oralig'i bilan.
-  Mijozlar reytingi uchun by='customer'.
-- Tahlil qilganda faqat raqamlarni emas, qisqa xulosa ham ber (masalan "X mijoz mayda
-  oldi: aprelda 50 mln, mayda 18 mln — 64% pasaygan").
+BALANS / FOYDA-ZARAR (P&L) HISOBOTLARI:
+- Foydalanuvchi "balans", "balance", "foyda-zarar", "pnl", "P&L" so'rasa — send_financial_statement
+  tool'ini ishlat (document="balance" yoki "pnl"). Data REAL ERPNext'dan (GL Entry) olinadi,
+  oylik ustunlarda, kompaniyaning rus tilidagi hisob nomlari bilan chiqadi.
+- period_start_date/period_end_date BER. Sana aytilmasa, foydalanuvchidan qaysi davr ekanini
+  SO'RA (masalan "oxirgi 4 oy" => bugungi oydan orqaga 4 oy).
+- Bu kompaniyada moliyaviy yil sozlamasi muammoli — shuning uchun balans/pnl uchun DOIM
+  send_financial_statement ishlat, send_report_file("Balance Sheet"/"Profit and Loss") ISHLATMA.
+- Boshqa hisobotlar (General Ledger, Trial Balance, Accounts Receivable, Cash Flow...) uchun
+  esa send_report_file yoki get_report_data ishlatishda davom et.
+
+============ BILIMLAR BAZASI: SAVOL TURI => QAYERDAN OLINADI ============
+Quyidagi yo'riqnomaga qat'iy amal qil. Sotuv/xarid summalari uchun DOIM ["docstatus","=",1]
+filtrini qo'sh. Sana oralig'i uchun ["posting_date","between",["BOSH","OXIR"]].
+
+— SAVDO (Sales) —
+- "Bu oy savdo qancha / jami sotuv" => erp_aggregate, doctype="Sales Invoice",
+  metric="sum", field="base_grand_total", group_by="company" (yoki istalgan), posting_date filtri.
+  (group_by shart; umumiy yig'indi uchun group_by="company" qo'yib, natijani qo'sh.)
+- "O'tgan oy bilan solishtir" => shu oy uchun bitta, o'tgan oy uchun ikkinchi erp_aggregate;
+  keyin farq va foiz o'zgarishini hisobla.
+- "Top 10 mahsulot / eng ko'p sotilgan" => erp_profit_breakdown, by="item_code",
+  rank_by="revenue" (yoki "qty"), order="desc", top=10.
+- "Eng kam sotilgan mahsulotlar" => erp_profit_breakdown, by="item_code", rank_by="qty",
+  order="asc". (Eslatma: bu faqat SOTILGAN tovarlar ichida eng kami; umuman sotilmaganlar
+  uchun Stock hisoboti kerak — buni aytib qo'y.)
+- "Qaysi filial ko'proq sotmoqda" => erp_aggregate, doctype="Sales Invoice",
+  group_by="branch" (ishlamasa group_by="territory" yoki "cost_center" yoki "set_warehouse").
+- "Kunlik savdo trendi" => erp_aggregate, doctype="Sales Invoice", group_by="posting_date",
+  metric="sum", field="base_grand_total", order="asc", posting_date filtri.
+- "Haftalik savdo trendi" => avval kunlik olib (yuqoridagidek), keyin haftalarga o'zing yig'.
+
+— OMBOR (Stock) —
+- "Joriy qoldiq / eng ko'p qoldiq qaysi mahsulotda" => erp_list, doctype="Bin",
+  fields=["item_code","warehouse","actual_qty","valuation_rate"], order_by="actual_qty desc".
+  Yoki to'liq surat uchun erp_run_report("Stock Balance", {"company":..,"from_date":..,"to_date":..}).
+- "Qaysi mahsulotlar tugab qolmoqda / safety stockdan past" =>
+  erp_run_report("Item Shortage Report") yoki Bin'da actual_qty kichik bo'lganlarini ko'r.
+- "Slow moving / dead stock / uzoq turgan tovar" => erp_run_report("Stock Ageing",
+  {"company":..,"to_date":..}); yoshi katta (uzoq harakatsiz) tovarlar = slow/dead stock.
+- "Inventory turnover" => standart bitta hisobot yo'q. Stock Balance (zaxira qiymati) va
+  shu davr sotilgan miqdor/COGS asosida taxminiy hisobla va metodikani tushuntir.
+
+— XARID (Purchase) —
+- "Bu oy qancha xarid" => erp_aggregate, doctype="Purchase Invoice", metric="sum",
+  field="base_grand_total", group_by="company", posting_date filtri (docstatus=1).
+- "Eng ko'p xarid qilingan mahsulotlar" => erp_run_report("Item-wise Purchase Register",
+  {"company":..,"from_date":..,"to_date":..}); item bo'yicha qty/amount natijasini saralab ber.
+- "Yetkazib beruvchi bo'yicha xarid" => erp_aggregate, doctype="Purchase Invoice",
+  group_by="supplier", metric="sum", field="base_grand_total".
+- "Xarid narxlari o'zgarishi" => Item-wise Purchase Register'dagi rate ustunini davrlar
+  bo'yicha solishtir, yoki erp_list "Item Price" (buying narxlari).
+
+— TRANZAKSIYALAR / PUL OQIMI (chuqur tafsilot) —
+- "Bu to'lov/hujjat nima edi", "pul qayerdan qayerga ketdi", "qaysi schotlar (hisoblar)
+  ishladi", "provodka" => erp_ledger(voucher_no="HUJJAT-RAQAMI"). Natijada ikki tomonlama
+  yozuv chiqadi: account (debet/kredit qilingan hisob) va against (qarama-qarshi hisob).
+  Tushuntir: "X hisobdan Y hisobga Z so'm o'tdi".
+- "Falon mijoz/yetkazib beruvchi bilan harakatlar / hisob-kitob" => erp_ledger(party="Nomi",
+  from_date, to_date). debet/kredit bo'yicha kim kimga qarzdorligini ko'rsat.
+- "Kimga sotdik / kim oldi" => Sales Invoice (customer). "Kimdan oldik / kimga to'ladik" =>
+  Purchase Invoice (supplier) yoki Payment Entry. To'lov tafsiloti uchun erp_ledger yoki
+  erp_get_doc("Payment Entry", nomi): paid_from = pul chiqgan hisob, paid_to = pul kirgan hisob,
+  party = qarshi taraf.
+- "Bank/kassa harakati" => erp_ledger(account="Банк") yoki account="Наличные", sana oralig'i bilan.
+- Provodkani tushuntirganda DOIM: sana, summa, qaysi hisobdan→qaysi hisobga, party (kim),
+  manba hujjat (voucher_no) va izoh (remarks) ni ber. Raqamlarni o'qiladigan qil.
+
+— MOLIYA (ERPNext) —
+- "Debitor qarzdorlik / mijoz qarzlari" => erp_run_report("Accounts Receivable",
+  {"company":..,"report_date":"<bugun yoki so'ralgan sana>"}).
+- "Kreditor qarzdorlik" => erp_run_report("Accounts Payable", {"company":..,"report_date":..}).
+- "Cash flow / pul oqimi" => get_report_data("Cash Flow", period_start_date/period_end_date bilan).
+- "Outstanding / to'lanmagan fakturalar" => erp_list, doctype="Sales Invoice",
+  filters=[["docstatus","=",1],["status","in",["Unpaid","Overdue","Partly Paid"]]],
+  fields=["name","customer","grand_total","outstanding_amount","due_date","status"].
+
+— FOYDALANUVCHI FAOLIYATI —
+- "Bugun/kecha kim invoice yaratdi" => erp_list, doctype="Sales Invoice",
+  filters=[["creation","between",["<sana> 00:00:00","<sana> 23:59:59"]]],
+  fields=["name","owner","creation","customer","grand_total"]. owner = yaratgan odam (email).
+- "Qaysi operator eng ko'p hujjat kiritgan / user activity ranking" => erp_aggregate,
+  kerakli doctype, group_by="owner", metric="count" (creation sanasi filtri bilan).
+- "Kim stock entry / sales order yaratgan" => erp_list, doctype="Stock Entry" yoki
+  "Sales Order", fields=["name","owner","creation"], creation filtri bilan.
+- "Kim oxirgi 7 kunda tizimga kirmagan" => erp_list, doctype="User",
+  fields=["name","full_name","last_active","last_login","enabled"],
+  filters=[["enabled","=",1],["last_active","<","<bugun-7kun> 00:00:00"]].
+
+— HR (agar ERPNext HR moduli yoqilgan bo'lsa) —
+- "Davomat" => erp_list, doctype="Attendance",
+  fields=["employee_name","attendance_date","status","working_hours"], attendance_date filtri.
+- "Kechikishlar" => Attendance filters=[["late_entry","=",1]] yoki "Employee Checkin".
+- "Ta'tillar" => erp_list, doctype="Leave Application",
+  fields=["employee_name","leave_type","from_date","to_date","status"].
+- "Ish soatlari" => Attendance "working_hours" yoki erp_list "Timesheet".
+- Agar tool "DocType ... not found" yoki shunga o'xshash xato qaytarsa => HR moduli
+  yoqilmagan bo'lishi mumkin; buni foydalanuvchiga sodda tilda ayt.
+
+UMUMIY QOIDALAR:
+- "REAL FOYDA" so'ralsa => erp_profit_breakdown yoki erp_run_report("Gross Profit").
+  Tannarx (valuation) kiritilmagan bo'lsa foyda bo'sh chiqadi — buni ayt va tushum
+  (revenue) bo'yicha tahlil taklif qil. Tushum ≠ foyda ekanini aniq tushuntir.
+- "Falon mijozning qaysi tovari" => erp_profit_breakdown, customer="Mijoz", by="item_code".
+- Maydon nomi noto'g'ri bo'lib xato kelsa, muqobil maydonni sina (masalan branch↔territory).
+- "...Item" child table'ni erp_aggregate bilan GURUHLAMA — tovar tahlili uchun erp_profit_breakdown.
+- Oyma-oy yoki "oldin va hozir" solishtiruvda: har davr uchun alohida chaqir, so'ng farq va
+  foiz o'zgarishini ko'rsat (masalan "aprel 50 mln → may 18 mln, 64% pasaygan").
+- So'ralgan ma'lumot tizimda bo'lmasa yoki tool xato qaytarsa — TO'QIMA, ochiq ayt.
 
 FAYL (PDF/Excel) YUBORISH:
 - Foydalanuvchi hisobotni "PDF qilib jo'nat", "Excel/fayl qilib ber", "yuklab ber" desa —
@@ -759,8 +1369,44 @@ HISOBOTNI TAHLIL QILISH (CFO / moliyachi sifatida):
   beriladigan xavflar, va 3-5 ta ANIQ amaliy tavsiya. Raqamlarni o'qiladigan qil.
 - Tahlil uchun bir nechta hisobotni birga olib solishtirsang bo'ladi (masalan P&L + Cash Flow).
 
-Hech qachon ma'lumotni o'zingdan to'qima — faqat tool natijasiga asoslanib javob ber.
-Agar tool xato qaytarsa, foydalanuvchiga sodda tilda tushuntir."""
+JAVOB KO'RINISHI (UI) — foydalanuvchi BIZNES EGASI, Telegram'da o'qiydi:
+- Telegram oddiy MATN ko'rsatadi (markdown emas). '**', '#', '|' jadval, '```' belgilarini
+  ISHLATMA — xunuk ko'rinadi. Toza matn yoz. Sarlavhaga emoji + BOSH HARF mumkin ("📊 SAVDO").
+- Avval BITTA jumlada asosiy javob/xulosa, keyin kerak bo'lsa tafsilot. Qisqa va lo'nda.
+- Ro'yxat uchun "• " yoki "1) 2) 3)". Raqamni minglik bo'sh joy bilan: 1 234 567 + VALYUTA.
+  O'sish/pasayishni "▲ 12%" / "▼ 8%", sanani "17.06.2026" ko'rinishida.
+- Uzun ro'yxat (8-10 dan ko'p) bo'lsa eng muhim 10 tasini ko'rsat, "to'liqini Excel qilib
+  beraymi?" deb taklif qil.
+
+SODDA TIL (buxgalter emas, biznes egasi uchun):
+- Buxgalteriya atamalarini sodda tilga o'gir: "debet/kredit" o'rniga "pul kirdi/chiqdi" yoki
+  "qarz oshdi/kamaydi"; "provodka" o'rniga "bu pul qayerdan qayerga o'tgani".
+- Hisob (schot) raqamlarini (masalan "5215", "1220 - Банк р/c") odatda KO'RSATMA — uning
+  ODDIY MA'NOSINI yoz: "Bank hisobidan", "Soliq xarajatiga", "Mijozlar qarzi". Faqat
+  foydalanuvchi aniq "schot/hisob raqami" so'rasa kodni ber.
+- Rus tilidagi hisob nomlarini o'zbekchaga tushuntir (Аренда помещение = bino ijarasi,
+  Дилерский бонусы = dilerlik bonusi, Дебиторская задолженность = mijozlar qarzi).
+
+ATAMALAR — DOIM bir xil ta'rifga amal qil (javoblar ziddiyatli bo'lmasin):
+- "Savdo/sotuv" = Sales Invoice (docstatus=1). "Xarid" = Purchase Invoice.
+- "To'lov" = Payment Entry. "Naqd/kassa" = naqd pul (Наличные / mode_of_payment Cash).
+  "Bank" = bank hisobi (Банк р/c). Foydalanuvchi "kassa/to'lovlar" desa — naqd VA bank
+  to'lovlarini ALOHIDA ko'rsat (to'liq surat), shunda javob ziddiyatsiz bo'ladi.
+- Bir savol qayta berilsa, AVVALGI javob bilan mos kelsin — filtr/davrni o'zboshimcha
+  o'zgartirib boshqa raqam berma. "Kechagi to'lovlar" har safar bir xil chiqishi shart.
+
+XATO YUZ BERSA:
+- Foydalanuvchiga HECH QACHON xom xatoni (kod 417, "EXPECTATION FAILED", maydon nomlari,
+  stack-trace) ko'rsatma — bu chalkashtiradi. Bitta sodda jumlada ayt va DARHOL boshqa usul
+  bilan urin (masalan Journal Entry o'rniga erp_ledger, yoki boshqa maydon). Texnik tafsilot
+  berma va "kerakmi?" deb so'rama — muammoni o'zing yech, faqat natijani ber.
+
+DAVR (sana) berilmaganda:
+- Hisobot/tahlil so'ralsa-yu davr aytilmasa, har safar SO'RAB o'tirma. Eng mantiqiy davrni
+  (odatda shu oy yoki oxirgi to'liq oy) O'ZING tanla, qaysi davr olganingni AYTIB qo'y va
+  "boshqa davr kerak bo'lsa ayting" deb qo'sh. Faqat haqiqatan noaniq bo'lsagina so'ra.
+
+Hech qachon ma'lumotni o'zingdan to'qima — faqat tool natijasiga asoslanib javob ber."""
 
 
 # ============ Claude API bilan agentik tsikl =================================
@@ -823,14 +1469,43 @@ def _retry_wait(resp, attempt):
     return min(ANTHROPIC_BACKOFF_CAP, 2 ** attempt)
 
 
-def ask_claude(history, chat_id=None):
+# Tahlil/CFO talab qiladigan savollar — bularga kuchliroq model (MODEL_SMART) ishlatiladi.
+_SMART_KEYWORDS = (
+    "tahlil", "analiz", "cfo", "moliyachi", "baho", "izoh", "tushuntir", "nima qilish",
+    "tavsiya", "maslahat", "trend", "solishtir", "prognoz", "strategiya", "sabab",
+    "nega", "nima uchun", "xulosa", "dinamika", "o'sish", "pasay",
+)
+
+
+def _pick_model(text):
+    """So'rovga qarab modelni tanlaydi: oddiy savol => MODEL (arzon),
+    tahlil/izoh talab qiladigan savol => MODEL_SMART (kuchliroq, agar sozlangan bo'lsa).
+    Shunday qilib token va pul tejaymiz, sifatni esa kerak joyda oshiramiz."""
+    if MODEL_SMART:
+        t = (text or "").lower()
+        if any(k in t for k in _SMART_KEYWORDS):
+            return MODEL_SMART
+    return MODEL
+
+
+def _safe_truncate_result(out, limit=50000):
+    """Tool natijasi juda uzun bo'lsa, kesib, ochiq belgi qo'shamiz — Claude
+    natija qisqartirilganini biladi va noto'g'ri xulosa chiqarmaydi."""
+    if len(out) <= limit:
+        return out
+    return out[:limit] + "\n…[natija juda uzun bo'lgani uchun qisqartirildi]"
+
+
+def ask_claude(history, chat_id=None, model=None):
     """history — Anthropic messages ro'yxati. Tool'larni bajarib, yakuniy javobni qaytaradi.
-    chat_id — fayl yuboradigan tool'lar uchun (send_report_file)."""
+    chat_id — fayl yuboradigan tool'lar uchun. model — tanlangan model (yo'q bo'lsa MODEL)."""
+    use_model = model or MODEL
     for _ in range(8):   # ko'pi bilan 8 marta tool chaqirishga ruxsat
         data = _anthropic_post({
-            "model": MODEL,
-            "max_tokens": 1500,
-            "system": SYSTEM_PROMPT,
+            "model": use_model,
+            "max_tokens": 4096,        # uzun CFO tahlili o'rtada kesilmasligi uchun
+            "temperature": 0,          # faktik/moliyaviy javob — barqaror va aniq bo'lsin
+            "system": _system_blocks(),  # statik qism keshlanadi + bugungi sana bloki
             "tools": TOOLS,
             "messages": history,
         })
@@ -845,7 +1520,7 @@ def ask_claude(history, chat_id=None):
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block["id"],
-                        "content": out[:50000],   # juda uzun natijani kesamiz
+                        "content": _safe_truncate_result(out),
                     })
             history.append({"role": "user", "content": results})
             continue   # natija bilan Claude'ga qайта murojaat
@@ -857,14 +1532,81 @@ def ask_claude(history, chat_id=None):
 
 
 # ============ Telegram long-polling ==========================================
-SESSIONS = {}   # chat_id -> messages tarixi (oddiy xotira; restartda o'chadi)
+SESSIONS = {}        # chat_id -> messages tarixi (oddiy xotira; restartda o'chadi)
+SESSION_TS = {}      # chat_id -> oxirgi faollik vaqti (eski sessiyalarni tozalash uchun)
+SESSION_LOCKS = {}   # chat_id -> Lock (bitta chatdan ikki xabar bir vaqtda kelsa, ketma-ket)
+SESSIONS_GUARD = threading.Lock()  # SESSIONS/SESSION_TS/SESSION_LOCKS lug'atlarini himoya qiladi
+SESSION_TTL = 6 * 3600   # 6 soat faolsiz sessiya o'chiriladi
+SESSION_MAX = 500        # ko'pi bilan shuncha sessiya saqlanadi (xotira o'smasligi uchun)
 ERP_TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 
+def _get_chat_lock(chat_id):
+    with SESSIONS_GUARD:
+        lock = SESSION_LOCKS.get(chat_id)
+        if lock is None:
+            lock = SESSION_LOCKS[chat_id] = threading.Lock()
+        return lock
+
+
+def _prune_sessions():
+    """Eskirgan yoki haddan ko'p sessiyalarni o'chiradi (xotira sızmasligi uchun)."""
+    now = time.time()
+    with SESSIONS_GUARD:
+        old = [cid for cid, ts in SESSION_TS.items() if now - ts > SESSION_TTL]
+        for cid in old:
+            SESSIONS.pop(cid, None)
+            SESSION_TS.pop(cid, None)
+            SESSION_LOCKS.pop(cid, None)
+        if len(SESSIONS) > SESSION_MAX:
+            # eng eski faollikdagilarni o'chiramiz
+            for cid, _ in sorted(SESSION_TS.items(), key=lambda kv: kv[1])[:len(SESSIONS) - SESSION_MAX]:
+                SESSIONS.pop(cid, None)
+                SESSION_TS.pop(cid, None)
+                SESSION_LOCKS.pop(cid, None)
+
+
+def _trim_history(hist, keep=20):
+    """Tarixni cheklaydi, LEKIN tool_use/tool_result juftligini buzmaydi.
+    Kesish nuqtasini oddiy foydalanuvchi xabaridan (role=user, content=matn)
+    boshlanadigan joyga suradi — aks holda Anthropic API 400 xato qaytaradi."""
+    if len(hist) <= keep:
+        return
+    cut = len(hist) - keep
+    while cut < len(hist):
+        m = hist[cut]
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            break
+        cut += 1
+    if cut < len(hist):     # xavfsiz nuqta topildi
+        del hist[:cut]
+    # topilmasa — kesmaymiz (to'g'rilik xotiradan muhimroq)
+
+
+def _split_for_telegram(text, limit=3800):
+    """Uzun matnni bo'laklarga ajratadi, lekin imkon qadar QATOR chegarasidan kesadi
+    (so'z/qator o'rtasidan kesib xabarni buzmaydi)."""
+    parts, buf = [], ""
+    for line in text.split("\n"):
+        if len(line) > limit:                     # juda uzun bitta qator — majburan kesamiz
+            if buf:
+                parts.append(buf); buf = ""
+            for i in range(0, len(line), limit):
+                parts.append(line[i:i + limit])
+            continue
+        if len(buf) + len(line) + 1 > limit:
+            parts.append(buf); buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        parts.append(buf)
+    return parts or [""]
+
+
 def tg_send(chat_id, text):
-    for i in range(0, len(text), 4000):
+    for part in _split_for_telegram(text):
         requests.post(f"{ERP_TG_API}/sendMessage",
-                      data={"chat_id": chat_id, "text": text[i:i + 4000]}, timeout=30)
+                      data={"chat_id": chat_id, "text": part}, timeout=30)
 
 
 def tg_send_document(chat_id, filename, content, caption=None):
@@ -876,6 +1618,63 @@ def tg_send_document(chat_id, filename, content, caption=None):
                   data=data,
                   files={"document": (filename, content)},
                   timeout=120)
+
+
+def handle_message(msg):
+    """Bitta Telegram xabarini to'liq qayta ishlaydi (alohida thread'da chaqiriladi).
+    Bitta chatdan ikki xabar bir vaqtda kelsa, per-chat lock ularni ketma-ket bajaradi —
+    shunda tarix (history) buzilmaydi va uzun hisobot boshqalarni bloklamaydi."""
+    text = msg.get("text")
+    chat_id = msg.get("chat", {}).get("id")
+    user_id = msg.get("from", {}).get("id")
+    if not text or chat_id is None:
+        return
+
+    # Xavfsizlik: faqat ruxsat etilgan foydalanuvchilar
+    if user_id not in ALLOWED_USERS:
+        _log("RAD ETILDI", f"user={user_id}", f"chat={chat_id}")
+        tg_send(chat_id, "Kechirasiz, sizga bu botdan foydalanishga ruxsat yo'q.")
+        return
+
+    cmd = text.strip()
+    if cmd in ("/start", "/help"):
+        tg_send(chat_id, "Salom! Men ERPNext yordamchingizman.\n"
+                         "Savol bering, masalan:\n"
+                         "• Kecha kim sales invoice kiritgan?\n"
+                         "• Invoys qilinmagan delivery note'lar qancha?\n"
+                         "• Bu oygi naqd kassa qancha?\n"
+                         "• Balans / foyda-zarar (pnl) faylini ber\n"
+                         "Suhbatni tozalash: /reset")
+        return
+    if cmd == "/reset":
+        with SESSIONS_GUARD:
+            SESSIONS.pop(chat_id, None)
+            SESSION_TS.pop(chat_id, None)
+        tg_send(chat_id, "Suhbat tozalandi.")
+        return
+
+    model = _pick_model(text)
+    _log("SAVOL", f"user={user_id}", f"model={model}", repr(text[:200]))
+
+    # Per-chat lock — shu chatning xabarlari ketma-ket ishlanadi
+    with _get_chat_lock(chat_id):
+        tg_send(chat_id, "🔎 Tekshiryapman...")
+        with SESSIONS_GUARD:
+            hist = SESSIONS.setdefault(chat_id, [])
+            SESSION_TS[chat_id] = time.time()
+        hist.append({"role": "user", "content": text})
+        _trim_history(hist)
+        try:
+            answer = ask_claude(hist, chat_id, model=model)
+        except Exception as e:
+            # To'liq xatoni log'ga yozamiz, foydalanuvchiga sodda xabar beramiz
+            _log("XATO", f"chat={chat_id}", repr(str(e)))
+            traceback.print_exc()
+            answer = ("Kechirasiz, javob tayyorlashda texnik xatolik yuz berdi. "
+                      "Birozdan so'ng qayta urinib ko'ring.")
+        with SESSIONS_GUARD:
+            SESSION_TS[chat_id] = time.time()
+    tg_send(chat_id, answer)
 
 
 def main():
@@ -899,6 +1698,7 @@ def main():
             resp = requests.get(f"{ERP_TG_API}/getUpdates",
                                 params={"offset": offset, "timeout": 30}, timeout=40)
             updates = resp.json().get("result", [])
+            _prune_sessions()
             for upd in updates:
                 uid = upd["update_id"]
                 # offset'ni DARHOL oldinga suramiz — Telegram bu update'ni qayta yubormaydi
@@ -911,41 +1711,10 @@ def main():
                     seen.add(uid)
 
                 msg = upd.get("message") or {}
-                text = msg.get("text")
-                chat_id = msg.get("chat", {}).get("id")
-                user_id = msg.get("from", {}).get("id")
-                if not text or chat_id is None:
+                if not msg.get("text"):
                     continue
-
-                # Xavfsizlik: faqat ruxsat etilgan foydalanuvchilar
-                if user_id not in ALLOWED_USERS:
-                    tg_send(chat_id, "Kechirasiz, sizga bu botdan foydalanishga ruxsat yo'q.")
-                    continue
-
-                if text.strip() in ("/start", "/help"):
-                    tg_send(chat_id, "Salom! Men ERPNext yordamchingizman.\n"
-                                     "Savol bering, masalan:\n"
-                                     "• Kecha kim sales invoice kiritgan?\n"
-                                     "• Invoys qilinmagan delivery note'lar qancha?\n"
-                                     "• Bu oygi naqd kassa qancha?\n"
-                                     "Suhbatni tozalash: /reset")
-                    continue
-                if text.strip() == "/reset":
-                    SESSIONS.pop(chat_id, None)
-                    tg_send(chat_id, "Suhbat tozalandi.")
-                    continue
-
-                tg_send(chat_id, "🔎 Tekshiryapman...")
-                hist = SESSIONS.setdefault(chat_id, [])
-                hist.append({"role": "user", "content": text})
-                # tarixni juda uzun bo'lib ketmasligi uchun cheklaymiz
-                if len(hist) > 20:
-                    del hist[:len(hist) - 20]
-                try:
-                    answer = ask_claude(hist, chat_id)
-                except Exception as e:
-                    answer = f"Xatolik yuz berdi: {e}"
-                tg_send(chat_id, answer)
+                # Har xabarni alohida thread'da — uzun hisobot boshqa userlarni bloklamaydi
+                threading.Thread(target=handle_message, args=(msg,), daemon=True).start()
 
         except KeyboardInterrupt:
             print("To'xtatildi.")

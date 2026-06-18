@@ -20,6 +20,7 @@ Kerak:  pip install requests
 
 import io
 import os
+import re
 import ast
 import csv
 import json
@@ -1377,6 +1378,13 @@ JAVOB KO'RINISHI (UI) — foydalanuvchi BIZNES EGASI, Telegram'da o'qiydi:
   O'sish/pasayishni "▲ 12%" / "▼ 8%", sanani "17.06.2026" ko'rinishida.
 - Uzun ro'yxat (8-10 dan ko'p) bo'lsa eng muhim 10 tasini ko'rsat, "to'liqini Excel qilib
   beraymi?" deb taklif qil.
+- JADVAL (| ustun |) MUTLAQO ISHLATMA — Telegram'da quvurlar va yulduzchalar bo'lib chiqadi.
+  Oylarni solishtirganda har oyni ALOHIDA QATORDA ber. Masalan TO'G'RI ko'rinish:
+    📊 Yanvar–May 2026 (P&L)
+    • Yanvar: savdo 117 890, foyda 8 361 (7.1%)
+    • Fevral: savdo 130 003, foyda 2 317 (1.8%)
+    • May: savdo 105 940, foyda −5 773 (ZARAR ▼)
+  YOMON ko'rinish (ishlatma): "| Oy | Savdo | Foyda |" va "**qalin**" belgilar.
 
 SODDA TIL (buxgalter emas, biznes egasi uchun):
 - Buxgalteriya atamalarini sodda tilga o'gir: "debet/kredit" o'rniga "pul kirdi/chiqdi" yoki
@@ -1583,6 +1591,35 @@ def _trim_history(hist, keep=20):
     # topilmasa — kesmaymiz (to'g'rilik xotiradan muhimroq)
 
 
+_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)        # ## sarlavha
+_MD_HR = re.compile(r"^\s*([-*_])\1{2,}\s*$", re.M)          # --- *** ___ ajratuvchi qator
+_MD_TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$", re.M)  # |---|---| qator
+_MD_BULLET = re.compile(r"^(\s*)[*+]\s+", re.M)             # "* band" -> "• band"
+
+
+def _strip_markdown(text):
+    """Telegram oddiy matn ko'rsatadi — markdown belgilarini (** | --- # `) olib tashlaymiz,
+    aks holda foydalanuvchi yulduzcha/quvur/chiziqlarni ko'radi (UI buziladi).
+    Model qoidaga rioya qilmasa ham, chiqish DOIM toza bo'ladi."""
+    if not text:
+        return text
+    t = text.replace("`", "")
+    t = _MD_HEADING.sub("", t)
+    t = _MD_TABLE_SEP.sub("", t)          # jadval ajratuvchi qatorini o'chiramiz
+    t = _MD_HR.sub("", t)                 # gorizontal chiziqni o'chiramiz
+    out = []
+    for line in t.split("\n"):
+        if line.count("|") >= 2:          # jadval qatori -> toza matnga aylantiramiz
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            line = "   ".join(c for c in cells if c)
+        out.append(line)
+    t = "\n".join(out)
+    t = _MD_BULLET.sub(r"\1• ", t)        # "* " / "+ " bandlarni "• " ga
+    t = t.replace("**", "").replace("__", "")  # qolgan qalin belgilarini olib tashlaymiz
+    t = re.sub(r"\n{3,}", "\n\n", t)      # ortiqcha bo'sh qatorlarni qisqartiramiz
+    return t.strip()
+
+
 def _split_for_telegram(text, limit=3800):
     """Uzun matnni bo'laklarga ajratadi, lekin imkon qadar QATOR chegarasidan kesadi
     (so'z/qator o'rtasidan kesib xabarni buzmaydi)."""
@@ -1604,7 +1641,7 @@ def _split_for_telegram(text, limit=3800):
 
 
 def tg_send(chat_id, text):
-    for part in _split_for_telegram(text):
+    for part in _split_for_telegram(_strip_markdown(text)):
         requests.post(f"{ERP_TG_API}/sendMessage",
                       data={"chat_id": chat_id, "text": part}, timeout=30)
 

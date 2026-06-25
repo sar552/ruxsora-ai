@@ -29,7 +29,7 @@ import threading
 import traceback
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from zoneinfo import ZoneInfo
@@ -105,6 +105,11 @@ MODEL_SMART = globals().get("MODEL_SMART") or ""  # bo'sh => MODEL ishlatiladi
 TIMEZONE = globals().get("TIMEZONE") or "Asia/Tashkent"
 DOCUMENTS_DIR = globals().get("DOCUMENTS_DIR") or str(Path(__file__).with_name("documents"))
 CURRENCY = globals().get("CURRENCY") or ""      # kompaniya hisob valyutasi (avtomatik aniqlanadi)
+# Har kuni shu vaqtda (TIMEZONE bo'yicha) kechagi kun uchun avtomatik hisobot yuboriladi.
+# "02:00" => ertalab soat 2:00. Bo'sh ("") qo'ysangiz — avtomatik hisobot O'CHIQ.
+REPORT_TIME = globals().get("REPORT_TIME")
+if REPORT_TIME is None:
+    REPORT_TIME = "02:00"
 
 ERP_HEADERS = {"Authorization": f"token {ERP_KEY}:{ERP_SECRET}"}
 
@@ -1694,19 +1699,28 @@ def handle_message(msg):
 
     cmd = text.strip()
     if cmd in ("/start", "/help"):
+        rt = _parse_report_time(REPORT_TIME)
+        rt_line = (f"\nHar kuni {rt[0]:02d}:{rt[1]:02d} da avtomatik kunlik hisobot keladi.\n"
+                   "Hozir sinab ko'rish: /report" if rt else "")
         tg_send(chat_id, "Salom! Men ERPNext yordamchingizman.\n"
                          "Savol bering, masalan:\n"
                          "• Kecha kim sales invoice kiritgan?\n"
-                         "• Invoys qilinmagan delivery note'lar qancha?\n"
+                         "• Bugungi sotuvlar (chuqur)\n"
                          "• Bu oygi naqd kassa qancha?\n"
                          "• Balans / foyda-zarar (pnl) faylini ber\n"
-                         "Suhbatni tozalash: /reset")
+                         "Suhbatni tozalash: /reset"
+                         + rt_line)
         return
     if cmd == "/reset":
         with SESSIONS_GUARD:
             SESSIONS.pop(chat_id, None)
             SESSION_TS.pop(chat_id, None)
         tg_send(chat_id, "Suhbat tozalandi.")
+        return
+    if cmd == "/report":
+        # Kechagi kunlik hisobotni darhol tayyorlab yuboramiz (sinash uchun)
+        tg_send(chat_id, "📅 Kechagi kunlik hisobot tayyorlanmoqda... (bir oz vaqt oladi)")
+        threading.Thread(target=_send_daily_report, daemon=True).start()
         return
 
     model = _pick_model(text)
@@ -1733,9 +1747,103 @@ def handle_message(msg):
     tg_send(chat_id, answer)
 
 
+# ============ HAR KUNGI AVTOMATIK HISOBOT (scheduler) ========================
+# Har kuni REPORT_TIME (TIMEZONE bo'yicha) da KECHAGI kun uchun hisobot tuziladi va
+# ALLOWED_USERS ga yuboriladi. Oxirgi yuborilgan sana faylga yoziladi — restartda
+# bir kunda ikki marta yubormaslik uchun.
+_REPORT_STATE = Path(__file__).with_name(".last_report_date")
+
+
+def _parse_report_time(s):
+    """'HH:MM' => (soat, daqiqa). Noto'g'ri bo'lsa None (avtomatik hisobot o'chiq)."""
+    try:
+        hh, mm = str(s).strip().split(":")
+        h, m = int(hh), int(mm)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def _read_last_report():
+    try:
+        return _REPORT_STATE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_last_report(d):
+    try:
+        _REPORT_STATE.write_text(d, encoding="utf-8")
+    except OSError as e:
+        _log("Hisobot sanasini yozib bo'lmadi:", e)
+
+
+def _build_daily_report_prompt(day):
+    """Kechagi kun uchun Claude'ga beriladigan hisobot topshirig'i."""
+    wd = _WEEKDAYS_UZ[day.weekday()]
+    d = day.strftime("%Y-%m-%d")
+    return (
+        f"Bu — AVTOMATIK KUNLIK HISOBOT. {d} ({wd}) kuni uchun biznes hisobotini tayyorla. "
+        f"Faqat shu kunni ol (posting_date/creation = {d}). Quyidagi bo'limlarni qamra va "
+        "har birida CHUQUR ber (jami, nechta, eng katta/top kim, pul qayerga/qayerdan, holat):\n"
+        "1) SAVDO (Sales Invoice): jami sotuv, nechta, eng katta 3-5 mijoz, to'langan/qarz.\n"
+        "2) XARID (Purchase Invoice): jami, eng katta yetkazib beruvchilar.\n"
+        "3) TO'LOV/KASSA: naqd va bank alohida — kim to'ladi/kimga to'landi, qaysi hisobga.\n"
+        "4) ISHLAB CHIQARISH (Stock Entry): nechta, qancha mahsulot.\n"
+        "5) DIQQAT: g'ayrioddiy yoki katta operatsiyalar bo'lsa eslat.\n"
+        "Oxirida 1-2 jumlali umumiy XULOSA. Sodda, biznes egasi tushunadigan o'zbek tilida. "
+        "Biror bo'lim bo'sh bo'lsa qisqagina 'bo'lmadi' deb o't. Fayl yuborma — matn hisobot ber."
+    )
+
+
+def _send_daily_report():
+    """Kechagi kun hisobotini tuzib, barcha ruxsatli foydalanuvchilarga yuboradi."""
+    day = _now() - timedelta(days=1)
+    _log("Kunlik hisobot tayyorlanmoqda:", day.strftime("%Y-%m-%d"))
+    history = [{"role": "user", "content": _build_daily_report_prompt(day)}]
+    try:
+        report = ask_claude(history, chat_id=None, model=(MODEL_SMART or MODEL))
+    except Exception as e:
+        _log("Kunlik hisobot xatosi:", e)
+        report = None
+    if not report:
+        return
+    header = f"📅 KUNLIK HISOBOT — {day:%d.%m.%Y} ({_WEEKDAYS_UZ[day.weekday()]})\n\n"
+    for uid in ALLOWED_USERS:
+        try:
+            tg_send(uid, header + report)
+        except Exception as e:
+            _log("Hisobotni yuborib bo'lmadi:", uid, e)
+
+
+def _daily_report_loop():
+    """Fon tsikli: har daqiqada tekshiradi, REPORT_TIME yetganda (kuniga bir marta) yuboradi."""
+    hm = _parse_report_time(REPORT_TIME)
+    if not hm:
+        _log("Avtomatik kunlik hisobot O'CHIQ (REPORT_TIME bo'sh/noto'g'ri).")
+        return
+    hour, minute = hm
+    _log(f"Avtomatik kunlik hisobot YONIQ — har kuni {hour:02d}:{minute:02d} ({TIMEZONE}).")
+    while True:
+        try:
+            now = _now()
+            sched = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            today = now.strftime("%Y-%m-%d")
+            if now >= sched and _read_last_report() != today:
+                _write_last_report(today)   # avval belgilaymiz — takror yubormaslik uchun
+                _send_daily_report()
+        except Exception as e:
+            _log("Kunlik hisobot tsikli xatosi:", e)
+        time.sleep(60)
+
+
 def main():
     print("Bot ishga tushdi. To'xtatish: Ctrl+C")
     _autodetect_company()
+    # Har kungi avtomatik hisobot uchun fon tsiklini ishga tushiramiz
+    threading.Thread(target=_daily_report_loop, daemon=True).start()
 
     # Eski (bot o'chiq turgan paytdagi) xabarlarni tashlab yuboramiz —
     # qayta ishga tushganda eski savollarga javob bermasligi uchun.
